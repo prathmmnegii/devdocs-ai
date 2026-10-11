@@ -1,157 +1,176 @@
 
-from pathlib import Path
-
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 
 
-# Project configuration
-BASE_DIR = Path(__file__).resolve().parent
-VECTORSTORE_DIR = BASE_DIR / "vectorstore"
-
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-LLM_MODEL = "llama3.2"
+# Initial threshold based on your observed retrieval scores.
+# Lower squared L2 distance generally means a closer match.
+MAX_DISTANCE = 1.55
+RETRIEVAL_K = 5
 
 
-def load_vectorstore():
-    """Load the existing FAISS index."""
-
-    if not VECTORSTORE_DIR.exists():
-        raise FileNotFoundError(
-            "FAISS index not found. Run python ingest.py first."
-        )
+def build_rag_chain():
+    """Initialize local embeddings, the LLM, and the prompt."""
 
     embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
 
-    vectorstore = FAISS.load_local(
-        str(VECTORSTORE_DIR),
-        embeddings,
-        allow_dangerous_deserialization=True,
-    )
-
-    print("FAISS vectorstore loaded.")
-    return vectorstore
-
-
-def build_rag_chain():
-    """Create the retrieval and answer-generation pipeline."""
-
-    vectorstore = load_vectorstore()
-    retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 3}
-    )
-
     llm = ChatOllama(
-        model=LLM_MODEL,
+        model="llama3.2",
         temperature=0,
     )
 
     prompt = ChatPromptTemplate.from_template(
         """
-You are DevDocs AI, a technical documentation assistant.
+        You are DevDocs AI, an assistant that answers questions
+        using an uploaded PDF.
 
-Answer the question using ONLY the context provided below.
-If the context does not contain enough information, clearly
-say that you could not find the answer in the documentation.
-Do not invent facts.
+        Follow these rules:
+        1. Use only the supplied PDF passages.
+        2. If the passages do not contain enough evidence,
+           say that the PDF does not provide enough information.
+        3. Never invent facts or use outside knowledge.
+        4. Give a concise, direct answer.
+        5. Mention PDF page numbers when useful.
 
-Include a concise explanation and a practical example when
-the context supports one.
+        PDF PASSAGES:
+        {context}
 
-Context:
-{context}
+        QUESTION:
+        {question}
 
-Question:
-{question}
-
-Answer:
-"""
+        ANSWER:
+        """
     )
 
-    return retriever, llm, prompt
+    return embeddings, llm, prompt
 
 
-def ask_question(question, retriever, llm, prompt):
-    """Retrieve context and generate a grounded answer."""
+def index_uploaded_pdf(pdf_path, embeddings):
+    """Extract PDF text, create chunks, and build a FAISS index."""
 
-    documents = retriever.invoke(question)
+    loader = PyPDFLoader(str(pdf_path))
+    documents = loader.load()
+
+    documents = [
+        doc for doc in documents
+        if doc.page_content.strip()
+    ]
 
     if not documents:
+        raise ValueError(
+            "No selectable text was found in this PDF."
+        )
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=350,
+        chunk_overlap=70,
+        add_start_index=True,
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    if not chunks:
+        raise ValueError(
+            "No searchable text chunks could be created."
+        )
+
+    vectorstore = FAISS.from_documents(
+        chunks,
+        embeddings,
+    )
+
+    return vectorstore, len(documents), len(chunks)
+
+
+def ask_question(question, vectorstore, llm, prompt):
+    """Retrieve relevant passages and answer using PDF evidence."""
+
+    retrieved_docs = vectorstore.similarity_search_with_score(
+        question,
+        k=RETRIEVAL_K,
+    )
+
+    if not retrieved_docs:
         return {
             "answer": (
-                "I couldn't find relevant information in the "
-                "available documentation."
+                "I couldn't retrieve any passages from the PDF."
             ),
             "sources": [],
         }
 
-    context = "\n\n".join(
-        f"Source: {Path(doc.metadata.get('source', 'Unknown')).name}\n"
-        f"{doc.page_content}"
-        for doc in documents
-    )
+    print("\n--- RETRIEVAL DEBUG ---")
+    print("Question:", question)
 
-    messages = prompt.format_messages(
-        context=context,
-        question=question,
-    )
+    for rank, (document, score) in enumerate(
+        retrieved_docs,
+        start=1,
+    ):
+        print(
+            f"Result {rank} | "
+            f"Distance: {float(score):.4f} | "
+            f"Text: {document.page_content[:180]}"
+        )
 
-    response = llm.invoke(messages)
+    print("--- END RETRIEVAL DEBUG ---\n")
 
+    # Keep only passages within the initial distance threshold.
+    relevant_docs = [
+        (document, float(score))
+        for document, score in retrieved_docs
+        if float(score) <= MAX_DISTANCE
+    ]
+
+    if not relevant_docs:
+        return {
+            "answer": (
+                "I couldn't find sufficiently relevant information "
+                "in the uploaded PDF to answer that question. "
+                "Please try a question related to the document."
+            ),
+            "sources": [],
+        }
+
+    context_parts = []
     sources = []
-    seen = set()
 
-    for doc in documents:
-        source = Path(
-            doc.metadata.get("source", "Unknown")
-        ).name
+    for document, score in relevant_docs:
+        page = document.metadata.get("page")
+        page_number = page + 1 if page is not None else None
 
-        if source not in seen:
-            seen.add(source)
-            sources.append({
-                "name": source,
-                "content": doc.page_content,
-            })
+        page_label = (
+            f"Page {page_number}"
+            if page_number is not None
+            else "Unknown page"
+        )
+
+        context_parts.append(
+            f"[{page_label}]\n{document.page_content}"
+        )
+
+        sources.append({
+            "page": page_number,
+            "content": document.page_content,
+            "score": score,
+        })
+
+    context = "\n\n".join(context_parts)
+
+    response = llm.invoke(
+        prompt.format_messages(
+            context=context,
+            question=question,
+        )
+    )
 
     return {
         "answer": response.content,
         "sources": sources,
     }
-
-
-if __name__ == "__main__":
-    retriever, llm, prompt = build_rag_chain()
-
-    print("\nDevDocs AI is ready. Type 'exit' to quit.")
-
-    while True:
-        question = input("\nYour question: ").strip()
-
-        if question.lower() == "exit":
-            print("Goodbye!")
-            break
-
-        if not question:
-            print("Please enter a question.")
-            continue
-
-        try:
-            result = ask_question(
-                question, retriever, llm, prompt
-            )
-
-            print("\nAnswer:\n")
-            print(result["answer"])
-
-            print("\nSources:")
-            for source in result["sources"]:
-                print(f"- {source['name']}")
-
-        except Exception as error:
-            print(f"\nAn error occurred: {error}")

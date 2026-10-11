@@ -5,3 +5,4 @@ langchain-ollama
 sentence-transformers
 faiss-cpu
 streamlit
+pypdf
