@@ -1,18 +1,19 @@
 
+import hashlib
+import os
 import tempfile
-from pathlib import Path
 
 import streamlit as st
 
 from rag_pipeline import (
     build_rag_chain,
-    index_uploaded_pdf,
+    index_uploaded_pdfs,
     ask_question,
 )
 
 
 # --------------------------------------------------
-# Page configuration
+# PAGE CONFIGURATION
 # --------------------------------------------------
 
 st.set_page_config(
@@ -23,13 +24,48 @@ st.set_page_config(
 
 st.title("📚 DevDocs AI")
 st.caption(
-    "A local PDF question-answering assistant powered by "
-    "LangChain, FAISS, Hugging Face embeddings, and Ollama."
+    "Ask questions about your PDF documents using a local RAG pipeline."
 )
 
 
 # --------------------------------------------------
-# Initialize models
+# SESSION STATE INITIALIZATION
+# --------------------------------------------------
+
+DEFAULTS = {
+    "pdf_signature": None,
+    "vectorstore": None,
+    "messages": [],
+    "pdf_names": [],
+    "index_error": None,
+    "uploader_key": 0,
+    "index_info": None,
+}
+
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value.copy() if isinstance(value, list) else value
+
+
+# --------------------------------------------------
+# CLEAR SESSION CALLBACK
+# --------------------------------------------------
+
+def clear_current_session():
+    st.session_state.messages = []
+    st.session_state.pdf_signature = None
+    st.session_state.vectorstore = None
+    st.session_state.pdf_names = []
+    st.session_state.index_error = None
+    st.session_state.index_info = None
+
+    # Use a new widget key to reset the file uploader.
+    # Do not assign to the old uploader's session-state value.
+    st.session_state.uploader_key += 1
+
+
+# --------------------------------------------------
+# LOAD MODELS
 # --------------------------------------------------
 
 @st.cache_resource
@@ -37,228 +73,248 @@ def get_models():
     return build_rag_chain()
 
 
-try:
+with st.spinner("Loading local embedding and language models..."):
     embeddings, llm, prompt = get_models()
-except Exception as error:
-    st.error(
-        "Could not initialize the local AI models. "
-        "Check that Ollama is running and the llama3.2 model "
-        "is installed."
-    )
-    st.exception(error)
-    st.stop()
 
 
 # --------------------------------------------------
-# Initialize session state
-# --------------------------------------------------
-
-if "pdf_signature" not in st.session_state:
-    st.session_state.pdf_signature = None
-
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "pdf_name" not in st.session_state:
-    st.session_state.pdf_name = None
-
-
-# --------------------------------------------------
-# Sidebar
+# SIDEBAR
 # --------------------------------------------------
 
 with st.sidebar:
-    st.header("Document settings")
+    st.header("Document Settings")
 
-    if st.button(
-        "🗑️ Clear current session",
+    st.button(
+        "🗑️ Clear Session",
+        on_click=clear_current_session,
         use_container_width=True,
-    ):
-        st.session_state.vectorstore = None
-        st.session_state.pdf_signature = None
-        st.session_state.messages = []
-        st.session_state.pdf_name = None
-        st.rerun()
+    )
 
-    st.divider()
-
+    st.markdown("---")
     st.markdown("### How to use")
     st.markdown(
         """
-        1. Upload a PDF.
+        1. Upload one or more PDFs.
         2. Wait for indexing to finish.
-        3. Ask questions about the document.
-        4. Expand the source section to inspect the evidence.
+        3. Ask questions about their contents.
+        4. Check the retrieved source passages.
         """
     )
 
-    st.divider()
-
-    st.caption("LLM: Llama 3.2 via Ollama")
-    st.caption("Embeddings: all-MiniLM-L6-v2")
-    st.caption("Vector store: FAISS")
+    st.markdown("---")
+    st.caption("Local-first RAG • Python • LangChain • FAISS • Ollama")
 
 
 # --------------------------------------------------
-# PDF uploader
+# PDF UPLOADER
 # --------------------------------------------------
 
-uploaded_pdf = st.file_uploader(
-    "Upload your documentation PDF",
+uploaded_pdfs = st.file_uploader(
+    "Upload your PDF documents",
     type=["pdf"],
-    help="Upload a PDF containing selectable text.",
+    accept_multiple_files=True,
+    key=f"pdf_uploader_{st.session_state.uploader_key}",
+    help="Upload PDFs containing selectable text.",
 )
 
 
 # --------------------------------------------------
-# Process uploaded PDF
+# INDEX UPLOADED PDFS
 # --------------------------------------------------
 
-if uploaded_pdf is None:
-    st.info("Upload a PDF to start asking questions.")
+if uploaded_pdfs:
+    # Create a signature from file names and contents.
+    # This prevents unnecessary re-indexing on each rerun.
+    signature_hash = hashlib.sha256()
 
-else:
-    pdf_bytes = uploaded_pdf.getvalue()
+    for pdf in uploaded_pdfs:
+        signature_hash.update(pdf.name.encode("utf-8"))
+        signature_hash.update(pdf.getvalue())
 
-    # Detect document changes and avoid rebuilding the index
-    # on every Streamlit rerun.
-    signature = (
-        uploaded_pdf.name,
-        len(pdf_bytes),
-        hash(pdf_bytes),
-    )
+    current_signature = signature_hash.hexdigest()
 
-    if signature != st.session_state.pdf_signature:
-        st.session_state.vectorstore = None
-        st.session_state.pdf_signature = None
-        st.session_state.pdf_name = None
-        st.session_state.messages = []
+    if current_signature != st.session_state.pdf_signature:
+        temp_paths = []
 
         try:
-            with st.spinner(
-                "Extracting PDF text and building the search index..."
-            ):
-                with tempfile.NamedTemporaryFile(
-                    suffix=".pdf",
-                    delete=False,
-                ) as temp_file:
-                    temp_file.write(pdf_bytes)
-                    temp_path = Path(temp_file.name)
+            st.session_state.index_error = None
 
-                try:
-                    (
-                        vectorstore,
-                        page_count,
-                        chunk_count,
-                    ) = index_uploaded_pdf(
-                        temp_path,
-                        embeddings,
+            with st.spinner(
+                "Reading PDFs and building the searchable index..."
+            ):
+                pdf_inputs = []
+
+                for pdf in uploaded_pdfs:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=".pdf",
+                        delete=False,
+                    ) as temp_file:
+                        temp_file.write(pdf.getvalue())
+                        temp_path = temp_file.name
+
+                    temp_paths.append(temp_path)
+                    pdf_inputs.append((temp_path, pdf.name))
+
+                vectorstore, page_count, chunk_count = index_uploaded_pdfs(
+                    pdf_inputs,
+                    embeddings,
+                )
+
+                if chunk_count == 0:
+                    raise ValueError(
+                        "No readable text was found in the uploaded PDFs. "
+                        "Check whether they contain selectable text."
                     )
-                finally:
-                    temp_path.unlink(missing_ok=True)
 
                 st.session_state.vectorstore = vectorstore
-                st.session_state.pdf_signature = signature
-                st.session_state.pdf_name = uploaded_pdf.name
+                st.session_state.pdf_signature = current_signature
+                st.session_state.pdf_names = [
+                    pdf.name for pdf in uploaded_pdfs
+                ]
+                st.session_state.index_info = {
+                    "pages": page_count,
+                    "chunks": chunk_count,
+                }
 
-            st.success(
-                f"PDF indexed successfully: {page_count} pages "
-                f"with text and {chunk_count} searchable chunks."
-            )
+                # A new document collection starts a fresh conversation.
+                st.session_state.messages = []
 
-        except Exception as error:
+        except Exception as exc:
             st.session_state.vectorstore = None
             st.session_state.pdf_signature = None
-            st.session_state.pdf_name = None
+            st.session_state.pdf_names = []
+            st.session_state.index_info = None
+            st.session_state.index_error = str(exc)
 
-            st.error(f"Could not process this PDF: {error}")
+        finally:
+            for path in temp_paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
-    # --------------------------------------------------
-    # Chat interface
-    # --------------------------------------------------
 
-    if st.session_state.vectorstore is not None:
-        st.markdown(
-            f"**Current document:** `{st.session_state.pdf_name}`"
-        )
+# --------------------------------------------------
+# INDEX STATUS
+# --------------------------------------------------
 
-        st.divider()
+if st.session_state.index_error:
+    st.error(f"Could not index the PDFs: {st.session_state.index_error}")
 
-        # Display conversation history.
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+elif st.session_state.vectorstore is not None:
+    st.success(
+        f"Indexed {len(st.session_state.pdf_names)} PDF(s) successfully."
+    )
 
-                if message.get("sources"):
-                    with st.expander("📄 View PDF sources"):
-                        for source in message["sources"]:
-                            page = source.get("page")
+    if st.session_state.index_info:
+        col1, col2 = st.columns(2)
 
-                            if page is not None:
-                                st.markdown(f"**Page {page}**")
-                            else:
-                                st.markdown("**Page unavailable**")
+        with col1:
+            st.metric(
+                "Pages processed",
+                st.session_state.index_info["pages"],
+            )
 
-                            st.text(source["content"])
+        with col2:
+            st.metric(
+                "Text chunks created",
+                st.session_state.index_info["chunks"],
+            )
 
-        # Accept a new question.
-        question = st.chat_input(
-            "Ask a question about your PDF..."
-        )
+    with st.expander("View uploaded documents"):
+        for name in st.session_state.pdf_names:
+            st.write(f"📄 {name}")
 
-        if question:
-            st.session_state.messages.append({
-                "role": "user",
-                "content": question,
-            })
 
-            with st.chat_message("user"):
-                st.markdown(question)
+# --------------------------------------------------
+# CHAT HISTORY
+# --------------------------------------------------
 
-            with st.chat_message("assistant"):
-                with st.spinner(
-                    "Searching the PDF and generating an answer..."
-                ):
-                    try:
-                        result = ask_question(
-                            question,
-                            st.session_state.vectorstore,
-                            llm,
-                            prompt,
-                        )
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-                        answer = result["answer"]
-                        sources = result["sources"]
+        if message.get("sources"):
+            with st.expander("View retrieved sources"):
+                for i, source in enumerate(message["sources"], start=1):
+                    st.markdown(
+                        f"**Source {i}: {source['source']} "
+                        f"(Page {source['page']})**"
+                    )
+                    st.caption(
+                        f"Reranker score: {source.get('score', 0):.4f}"
+                    )
+                    st.write(source["content"])
+                    st.markdown("---")
 
-                        st.markdown(answer)
 
-                        if sources:
-                            with st.expander("📄 View PDF sources"):
-                                for source in sources:
-                                    page = source.get("page")
+# --------------------------------------------------
+# CHAT INPUT
+# --------------------------------------------------
 
-                                    if page is not None:
-                                        st.markdown(f"**Page {page}**")
-                                    else:
-                                        st.markdown(
-                                            "**Page unavailable**"
-                                        )
+question = st.chat_input(
+    "Ask a question about your uploaded PDFs...",
+    disabled=st.session_state.vectorstore is None,
+)
 
-                                    st.text(source["content"])
+if question:
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": question,
+        }
+    )
 
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": sources,
-                        })
+    with st.chat_message("user"):
+        st.markdown(question)
 
-                    except Exception as error:
-                        error_message = (
-                            "An error occurred while generating the answer."
-                        )
-                        st.error(error_message)
-                        st.exception(error)
+    with st.chat_message("assistant"):
+        with st.spinner("Searching documents and generating an answer..."):
+            try:
+                result = ask_question(
+                    question,
+                    st.session_state.vectorstore,
+                    llm,
+                    prompt,
+                )
 
+                answer = result["answer"]
+                sources = result.get("sources", [])
+
+                st.markdown(answer)
+
+                if sources:
+                    with st.expander("View retrieved sources"):
+                        for i, source in enumerate(sources, start=1):
+                            st.markdown(
+                                f"**Source {i}: {source['source']} "
+                                f"(Page {source['page']})**"
+                            )
+                            st.caption(
+                                "Reranker score: "
+                                f"{source.get('score', 0):.4f}"
+                            )
+                            st.write(source["content"])
+                            st.markdown("---")
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources,
+                    }
+                )
+
+            except Exception as exc:
+                error_message = (
+                    f"An error occurred while answering your question: {exc}"
+                )
+                st.error(error_message)
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": error_message,
+                        "sources": [],
+                    }
+                )
